@@ -10,7 +10,12 @@
   - 无缓存的整序列前向（贪心基线逐 token 调用，每轮重算全部前缀）
 两条路径走同一份注意力代码，仅 KV 缓存与遮罩不同，保证数值逐位一致。
 
-前向次数由模型内部计数器统计，用于网页展示"实际目标前向次数"。
+并发模型（关键）：
+  - 权重（参数、嵌入、LM head）是进程内唯一的固定单例，所有请求共享、只读；
+  - KV 缓存与前向计数是**每请求独立**的可变状态，由调用方创建
+    :class:`ModelState` 并在每次前向时显式传入，模型对象本身不再保存
+    任何缓存/计数，因此多个请求（线程）并发推理时互不串扰：
+    一个请求在推理中途停顿，另一个请求跑完只会改动它自己的状态。
 """
 
 from __future__ import annotations
@@ -34,11 +39,55 @@ D_MODEL = 128
 MAX_POS = 256
 
 
+class KVCache:
+    """单个请求在单个模型上的 KV 缓存。
+
+    每层保存一个 (k, v)，形状均为 (1, n_heads, seq_len, head_dim)。
+    缓存对象随请求创建、随请求释放，绝不挂在共享模型上。
+    """
+
+    def __init__(self, n_layers: int, n_heads: int, head_dim: int):
+        self._layers: list[tuple[torch.Tensor, torch.Tensor]] = [
+            (torch.empty(1, n_heads, 0, head_dim),
+             torch.empty(1, n_heads, 0, head_dim))
+            for _ in range(n_layers)
+        ]
+        self.cache_len = 0
+
+    def truncate(self, keep_len: int) -> None:
+        """把 KV 缓存截断到前 keep_len 个位置（拒绝后回滚用）。
+
+        keep_len 不小于当前缓存长度时不做任何操作（调用方随后会增量补齐）。
+        """
+        if keep_len >= self.cache_len:
+            return
+        self._layers = [(k[:, :, :keep_len, :].contiguous(),
+                         v[:, :, :keep_len, :].contiguous())
+                        for k, v in self._layers]
+        self.cache_len = keep_len
+
+    def __len__(self) -> int:
+        return self.cache_len
+
+
+class ModelState:
+    """单次请求在单个模型上的全部可变状态：KV 缓存 + 前向计数器。
+
+    每次推理请求各自持有一个实例；模型权重在请求间共享且只读，
+    本对象上的缓存与计数互不影响，从而支持多线程并发对照。
+    """
+
+    def __init__(self, model: "CausalTransformer"):
+        self.cache = KVCache(model.n_layers, model.n_heads, model.head_dim)
+        self.forward_count = 0
+
+
 class CausalTransformer(nn.Module):
     """带 KV 缓存的因果 Transformer。
 
-    KV 缓存以 list[tuple[Tensor, Tensor]] 形式保存，每层一个 (k, v)，
-    形状均为 (1, n_heads, seq_len, head_dim)。
+    权重在进程内只构建一次并被所有请求共享；前向所需的可变状态
+    （KV 缓存、前向计数）通过 ``state`` 参数显式传入，模型实例本身无状态，
+    可被任意线程并发调用。
     """
 
     def __init__(self, vocab_size: int, d_model: int, n_heads: int, n_layers: int):
@@ -66,40 +115,11 @@ class CausalTransformer(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.lm_head: nn.Linear | None = None
 
-        # KV 缓存与前向计数
-        self._cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None
-        self.cache_len = 0
-        self.forward_count = 0
-
-    # ---- 缓存管理 ----
-    def init_cache(self) -> None:
-        self._cache = [
-            (torch.empty(1, self.n_heads, 0, self.head_dim),
-             torch.empty(1, self.n_heads, 0, self.head_dim))
-            for _ in range(self.n_layers)
-        ]
-        self.cache_len = 0
-
-    def truncate_cache(self, keep_len: int) -> None:
-        """把 KV 缓存截断到前 keep_len 个位置（拒绝后回滚用）。
-
-        keep_len 大于当前缓存长度时不做任何操作（调用方随后会增量补齐）。
-        """
-        assert self._cache is not None
-        if keep_len >= self.cache_len:
-            return
-        self._cache = [(k[:, :, :keep_len, :].contiguous(),
-                        v[:, :, :keep_len, :].contiguous())
-                       for k, v in self._cache]
-        self.cache_len = keep_len
-
-    def reset_stats(self) -> None:
-        self.forward_count = 0
-
     # ---- 前向 ----
     def _attention_layer(self, x: torch.Tensor,
                          layer: nn.TransformerEncoderLayer,
-                         layer_idx: int, use_cache: bool) -> torch.Tensor:
+                         layer_idx: int, use_cache: bool,
+                         state: ModelState | None) -> torch.Tensor:
         B, T, _ = x.shape
         # norm_first 结构，缓存/无缓存两条路径完全共用这份计算
         h = layer.norm1(x)
@@ -115,11 +135,12 @@ class CausalTransformer(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         if use_cache:
-            pk, pv = self._cache[layer_idx]
+            assert state is not None, "use_cache=True 必须传入每请求的 ModelState"
+            pk, pv = state.cache._layers[layer_idx]
             past_len = pk.shape[2]
             k = torch.cat([pk, k], dim=2)
             v = torch.cat([pv, v], dim=2)
-            self._cache[layer_idx] = (k, v)
+            state.cache._layers[layer_idx] = (k, v)
             if T == 1:
                 # 单 token 增量：历史 KV 全部可见，无需遮挡
                 attn_mask = None
@@ -142,16 +163,17 @@ class CausalTransformer(nn.Module):
         return x
 
     def forward(self, token_ids: list[int] | torch.Tensor,
-                use_cache: bool) -> torch.Tensor:
+                use_cache: bool,
+                state: ModelState | None = None) -> torch.Tensor:
         """前向计算，返回 logits。
 
         - 传入 token id 列表（或 1D 张量）：返回形状 (seq_len, vocab_size)；
         - 传入 2D 张量：返回 (batch, seq_len, vocab_size)，仅无缓存模式支持。
-        use_cache=True 时走增量路径并追加/复用 KV 缓存；
-        use_cache=False 时整序列重算（基线路径），不触碰缓存。
-        每次调用 forward_count += 1。
+        use_cache=True 时走增量路径并追加/复用 ``state`` 中的 KV 缓存；
+        use_cache=False 时整序列重算（基线路径），不触碰任何缓存。
+        每次调用使该请求的 ``state.forward_count`` 加 1（无缓存调用若未
+        传入 state 则不计数，仅用于独立的底层校验）。
         """
-        self.forward_count += 1
         batched = isinstance(token_ids, torch.Tensor) and token_ids.dim() == 2
         if isinstance(token_ids, list):
             x_in = torch.tensor([token_ids], dtype=torch.long)
@@ -162,18 +184,24 @@ class CausalTransformer(nn.Module):
         T = x_in.shape[1]
 
         if use_cache:
-            if self._cache is None:
-                self.init_cache()
-            positions = torch.arange(self.cache_len, self.cache_len + T)
+            if state is None:
+                raise ValueError("use_cache=True 时必须传入该请求专属的 ModelState")
+            if batched:
+                raise ValueError("带 KV 缓存的增量前向不支持 batch 输入")
+            state.forward_count += 1
+            positions = torch.arange(state.cache.cache_len,
+                                     state.cache.cache_len + T)
         else:
+            if state is not None:
+                state.forward_count += 1
             positions = torch.arange(T)
 
         h = self.tok_emb(x_in) + self.pos_emb(positions)
         for i, layer in enumerate(self.blocks):
-            h = self._attention_layer(h, layer, i, use_cache)
+            h = self._attention_layer(h, layer, i, use_cache, state)
         logits = self.lm_head(self.ln_f(h))
         if use_cache:
-            self.cache_len += T
+            state.cache.cache_len += T
         return logits if batched else logits.squeeze(0)
 
 
@@ -221,7 +249,11 @@ _TARGET: CausalTransformer | None = None
 
 
 def get_models() -> tuple[CausalTransformer, CausalTransformer]:
-    """返回进程内单例 (draft, target)。"""
+    """返回进程内单例 (draft, target)。
+
+    仅权重是单例且只读；每个请求必须另行创建自己的 :class:`ModelState`，
+    不得在模型对象上共享 KV 缓存或前向计数。
+    """
     global _DRAFT, _TARGET
     if _TARGET is None:
         _DRAFT, _TARGET = _build_pair()

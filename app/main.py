@@ -5,6 +5,15 @@ from __future__ import annotations
 import os
 from dataclasses import asdict
 
+import torch
+
+# 收敛每个请求内部的 OpenMP/MKL 线程数：服务会并发处理多个请求，若每个
+# torch 前向都按整机核数开线程，少量并发即可耗尽进程/线程配额（实测会触发
+# libgomp "Thread creation failed"）。默认 2，可用 TORCH_NUM_THREADS 覆盖；
+# docker-compose 也显式注入该变量。必须在任何 torch 前向之前设置。
+_torch_threads = max(1, int(os.environ.get("TORCH_NUM_THREADS", "2")))
+torch.set_num_threads(_torch_threads)
+
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles

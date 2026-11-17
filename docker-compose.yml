@@ -5,7 +5,11 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # 单请求内部 torch 线程数；并发请求靠多线程处理，单请求线程必须收敛，
+      # 否则少量并发即耗尽容器线程配额（libgomp Thread creation failed）。
       - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - TORCH_NUM_THREADS=2
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
